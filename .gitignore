@@ -1,0 +1,27 @@
+# Obsidian workspace и кэш
+.obsidian/workspace
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/cache
+.obsidian/plugins/*/data.json
+
+# Если не хочешь синхронизировать плагины и темы
+# (убери эти строки, если хочешь их хранить)
+# .obsidian/plugins/
+# .obsidian/themes/
+
+# Obsidian Sync (если используешь)
+.obsidian/sync.json
+
+
+# OS мусор
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Trash папка Obsidian
+.trash/
+
+# Временные файлы
+*.tmp
+*.bak
