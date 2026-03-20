@@ -1,0 +1,481 @@
+# Раздел 3.X. Формальная модель Крипке механизма Go-Back-N (K_GBN)
+
+> **Источник:** Max von Hippel, *Verification and Attack Synthesis for Network Protocols*,
+> arXiv:2511.01124v1, 2025. Главы 3 и 4.
+> DOI: https://doi.org/10.48550/arXiv.2511.01124
+
+---
+
+## 3.X.1. Неформальное описание механизма
+
+Go-Back-N (GB(N)) — классический протокол автоматического запроса повторной
+передачи (ARQ), лежащий в основе механизма скользящего окна транспортных
+протоколов TCP Tahoe и TCP New Reno. Протокол обеспечивает надёжную
+упорядоченную (FIFO) доставку пакетов поверх ненадёжного канала.
+
+Ключевой параметр протокола — **размер окна N**: отправитель может
+одновременно держать в канале не более N неподтверждённых пакетов.
+Это и есть механизм **планирования канальных ресурсов**: окно определяет,
+какая доля канала в каждый момент времени задействована под полезную
+передачу.
+
+Высокоуровневая работа механизма:
+
+1. Отправитель передаёт пакеты с последовательными номерами в пределах
+   окна `[hiAck, hiAck+N)`.
+2. Если до истечения таймера RTO получен cumulative ACK с номером `a`,
+   окно сдвигается вперёд (`hiAck ← a`).
+3. Если таймер истекает без ACK — отправитель «идёт назад»:
+   `curPkt ← hiAck`, и окно передаётся повторно.
+
+---
+
+## 3.X.2. Компоненты системы и их интерфейсы
+
+Система GB(N) состоит из четырёх компонентов, взаимодействующих
+через четыре класса событий:
+
+| Событие     | Смысл                              | Output    | Input     |
+|-------------|------------------------------------|-----------|-----------|
+| `snds(d)`   | Отправитель помещает пакет в TBF_s | Sender    | TBF_s     |
+| `rcvr(d)`   | TBF_s доставляет пакет получателю  | TBF_s     | Receiver  |
+| `sndr(d)`   | Получатель помещает ACK в TBF_r    | Receiver  | TBF_r     |
+| `rcvs(d)`   | TBF_r доставляет ACK отправителю   | TBF_r     | Sender    |
+
+Каждый компонент формализуется как **Процесс** — структура Крипке,
+дополненная маркировкой переходов входными и выходными событиями
+(Definition 2, von Hippel, 2025):
+
+$$P = \langle AP,\; I,\; O,\; S,\; s_0,\; T,\; L \rangle$$
+
+где $T \subseteq S \times (I \cup O) \times S$, и $I \cap O = \emptyset$.
+
+### Компонент 1: Sender
+
+**Состояние:** $s_{send} = (hiAck,\; hiPkt,\; curPkt) \in \mathbb{N}^+_3$
+
+- `hiAck` — наибольший полученный cumulative ACK (изначально 1)
+- `hiPkt` — наибольший отправленный номер пакета (изначально не определён)
+- `curPkt` — номер следующего пакета к отправке (изначально 1)
+
+**Интерфейс:** $I_{send} = \{rcvs(d)\}$, $O_{send} = \{snds(d)\}$
+
+**Функции обновления состояния:**
+
+- **`rcvAck(s, a)`** — внешнее обновление по событию `rcvs(a, ACK)`.
+  Если `hiAck < a ≤ hiPkt+1`: `hiAck ← a`, `curPkt ← max(curPkt, a)`.
+  Иначе — состояние не меняется.
+
+- **`advCur(s, x)`** — внутреннее обновление с предусловием `curPkt < hiAck+N`.
+  Генерирует событие `snds(curPkt, x)`.
+  Обновляет: `hiPkt ← max(hiPkt, curPkt)`, затем `curPkt ← curPkt+1`.
+
+- **`timeout(s)`** — внутреннее обновление с предусловием `curPkt = hiAck+N`.
+  Сбрасывает окно: `curPkt ← hiAck`. Не генерирует события.
+
+**Отношение переходов `senderR`:**
+
+$$
+senderR(s, e, s') \;:=\;
+(\exists a \in \mathbb{N}^+ :\; e = rcvs(a, ACK) \wedge (s', \bot) = rcvAck(s, e))
+$$
+$$
+\vee\;\; (\exists x \in Str :\; e = snds(curPkt, x) \wedge curPkt < hiAck+N \wedge (s', e) = advCur(s, x))
+$$
+$$
+\vee\;\; (e = \bot \wedge curPkt = hiAck+N \wedge (s', e) = timeout(s))
+$$
+
+**Инварианты (Теорема 1, von Hippel, 2025):**
+
+- **Inv1:** $hiAck \leq hiPkt + 1$ — ACK не опережает отправленные пакеты
+- **Inv2:** $hiAck \leq curPkt \leq hiAck + N$ — `curPkt` всегда в пределах окна
+- **Inv3:** $hiAck$ и $hiPkt$ монотонно не убывают
+
+### Компонент 2: Receiver
+
+**Состояние:** $s_{recv} = r \subseteq \mathbb{N}^+$ — множество доставленных
+номеров пакетов (изначально $\emptyset$).
+
+**Интерфейс:** $I_{recv} = \{rcvr(d)\}$, $O_{recv} = \{sndr(d)\}$
+
+**Функции обновления:**
+
+- **`rcvPkt(r, i)`** — внешнее по `rcvr(i, x)`.
+  Если `i = min(N⁺ \ r)` (ожидаемый номер): `r ← r ∪ {i}`. Иначе — ничего.
+
+- **`sndAck(r)`** — внутреннее, без предусловия.
+  Генерирует `sndr(min(N⁺ \ r), ACK)`. Состояние `r` не меняется.
+
+Стратегия подтверждений оставлена **недетерминированной**: модель описывает
+все возможные реализации (каждый k-й пакет, каждый N-й, по расписанию и т.д.).
+
+**Инвариант (Теорема 2, von Hippel, 2025):**
+$r \subseteq r'$ — множество доставленных пакетов монотонно растёт.
+
+### Компонент 3 и 4: TBF_s и TBF_r (Token Bucket Filter)
+
+Оба TBF используют одну и ту же формальную модель.
+
+**Состояние:** $s_{tbf} = (bkt,\; dgs)$, где:
+
+- `bkt` ∈ ℕ — количество токенов в корзине (изначально 0, ограничено `bcap`)
+- `dgs` — список пар $(t, d)$: датаграмма $d$ и оставшееся время жизни $t$
+
+**Параметры конфигурации:** `bcap` (ёмкость корзины), `dcap`
+(байтовая ёмкость очереди), `rt` (скорость пополнения токенов), `del`
+(максимальная задержка, ординальное число ∈ Ord).
+
+TBF моделирует следующие сетевые эффекты:
+
+| Механизм             | Реализация в модели                                  |
+|----------------------|------------------------------------------------------|
+| Ограничение скорости | Форвардинг требует `bkt ≥ sz(d)` токенов             |
+| Нетерминированные потери | Любая датаграмма может быть сброшена в любой момент |
+| Переупорядочивание   | Форвардинг выбирает произвольный элемент из `dgs`    |
+| Ограниченная задержка | Датаграмма удаляется после `del` тактов              |
+
+---
+
+## 3.X.3. Параллельная композиция и синхронизация
+
+Полная система строится как параллельная композиция четырёх процессов
+(Definition 3, von Hippel, 2025):
+
+$$P_{GBN} = Sender \;\|\; TBF_s \;\|\; TBF_r \;\|\; Receiver$$
+
+**Правило синхронизации (rendezvous):** если событие $e$ является выходом
+одного процесса и входом другого, оба процесса обязаны выполнить переход
+**одновременно**. Процессы, для которых $e$ не является ни входом,
+ни выходом, не меняют состояния.
+
+Формально, переход в $P_{GBN}$:
+
+$$
+(s_1, s_2) \xrightarrow{x} (s_1', s_2') \;\in\; T_{P1 \| P2}
+$$
+
+выполняется тогда и только тогда, когда для каждого $i \in \{1,2\}$:
+если $x \in I_i \cup O_i$, то $(s_i, x, s_i') \in T_i$, иначе $s_i' = s_i$.
+
+Таблица синхронизации событий в $P_{GBN}$:
+
+| Событие   | Sender | TBF_s | TBF_r | Receiver |
+|-----------|--------|-------|-------|----------|
+| `snds(d)` | O      | I     | —     | —        |
+| `rcvr(d)` | —      | O     | —     | I        |
+| `sndr(d)` | —      | —     | I     | O        |
+| `rcvs(d)` | I      | —     | O     | —        |
+
+---
+
+## 3.X.4. Формальный кортеж K_GBN
+
+После построения параллельной композиции $P_{GBN}$ выполняется
+**проекция на конечную структуру Крипке**: метки событий на переходах
+удаляются, добавляется функция разметки $L$.
+
+$$K_{GBN} = \langle AP,\; S,\; s_0,\; T,\; L \rangle$$
+
+### Атомарные пропозиции AP
+
+$$
+AP = \{\; transmitting,\; window\_full,\; timeout\_fired,\;
+         pkt\_delivered,\; channel\_loss \;\}
+$$
+
+| Пропозиция       | Смысл в контексте планирования канала                  |
+|------------------|--------------------------------------------------------|
+| `transmitting`   | Канал занят полезной передачей: `curPkt < hiAck+N`     |
+| `window_full`    | Передача приостановлена: `curPkt = hiAck+N`            |
+| `timeout_fired`  | Ресурс канала потрачен впустую: требуется ретрансмиссия |
+| `pkt_delivered`  | Полезная работа: пакет доставлен приложению            |
+| `channel_loss`   | TBF сбросил датаграмму (перегрузка канала)             |
+
+### Множество состояний S
+
+$$
+S \;=\; S_{send} \times S_{tbfs} \times S_{tbfr} \times S_{recv}
+$$
+
+$$
+S_{send} = \mathbb{N}^+ \times (\mathbb{N}^+ \cup \{\bot\}) \times \mathbb{N}^+
+$$
+$$
+S_{recv} = 2^{\mathbb{N}^+}
+\qquad
+S_{tbf} = \mathbb{N} \times List(Ord \times Dg)
+$$
+
+### Начальное состояние $s_0$
+
+$$
+s_0 = \bigl(\underbrace{(1,\; \bot,\; 1)}_{Sender},\;
+             \underbrace{(0,\; [])}_{TBF_s},\;
+             \underbrace{(0,\; [])}_{TBF_r},\;
+             \underbrace{\emptyset}_{Receiver}\bigr)
+$$
+
+### Отношение переходов T
+
+$$
+T \;=\; \bigl\{\; (s, s') \mid \exists e :\;
+senderR(s_{send}, e, s_{send}') \;\wedge\;
+receiverR(s_{recv}, e, s_{recv}') \;\wedge\;
+tbfR_s(s_{tbfs}, e, s_{tbfs}') \;\wedge\;
+tbfR_r(s_{tbfr}, e, s_{tbfr}')
+\bigr\}
+$$
+
+### Функция разметки $L : S \to 2^{AP}$
+
+$$
+L(s) \ni transmitting  \;\iff\; curPkt < hiAck + N
+$$
+$$
+L(s) \ni window\_full  \;\iff\; curPkt = hiAck + N
+$$
+$$
+L(s) \ni timeout\_fired \;\iff\; \text{последнее событие} = \bot \text{ из } timeout(s)
+$$
+$$
+L(s) \ni pkt\_delivered \;\iff\; i = \min(\mathbb{N}^+ \setminus r) \text{ при } rcvr(i, x)
+$$
+$$
+L(s) \ni channel\_loss  \;\iff\; sz(dgs) + sz(d) > dcap
+$$
+
+---
+
+## 3.X.5. Верифицируемые LTL-свойства
+
+На построенной модели $K_{GBN}$ проверяются следующие свойства
+с помощью инструмента SPIN (model checker):
+
+### Свойства безопасности (Safety)
+
+$$
+\varphi_1 = \mathbf{G}(window\_full \;\to\; \neg\, transmitting)
+$$
+*«Когда окно заполнено, новые пакеты не передаются»* —
+корректность планирования окна.
+
+$$
+\varphi_2 = \mathbf{G}(hiAck \leq hiPkt + 1)
+$$
+*«ACK никогда не опережает отправленные пакеты»* — Inv1 из Теоремы 1.
+
+### Свойства живости (Liveness)
+
+$$
+\varphi_3 = \mathbf{G}(window\_full \;\to\; \mathbf{F}\, transmitting)
+$$
+*«Система всегда выходит из состояния заполненного окна»* —
+канал не блокируется навсегда.
+
+$$
+\varphi_4 = \mathbf{G}(timeout\_fired \;\to\; \mathbf{F}\, pkt\_delivered)
+$$
+*«После каждого таймаута рано или поздно пакет доставляется»* —
+ретрансмиссия не бесполезна.
+
+### Эффективность использования канала
+
+$$
+\varphi_5 = \mathbf{G}\,\mathbf{F}\, transmitting
+$$
+*«Канал не простаивает бесконечно»* — свойство живости канального ресурса.
+
+---
+
+## 3.X.6. Сводная таблица модели K_GBN
+
+| Элемент    | Определение                                                   |
+|------------|---------------------------------------------------------------|
+| $AP$       | `{transmitting, window_full, timeout_fired, pkt_delivered, channel_loss}` |
+| $S$        | $S_{send} \times S_{tbfs} \times S_{tbfr} \times S_{recv}$   |
+| $s_0$      | $((1, \bot, 1),\; (0,[]),\; (0,[]),\; \emptyset)$             |
+| $T$        | Параллельная композиция senderR ∥ tbfR_s ∥ tbfR_r ∥ receiverR с синхронизацией на событиях |
+| $L$        | Разметка по значениям переменных $curPkt$, $hiAck$, $N$, $r$, $dgs$ |
+| Инварианты | Inv1–Inv3 (Теорема 1), Inv4 (Теорема 2)                       |
+| Свойства   | $\varphi_1$–$\varphi_5$ (Safety + Liveness)                  |
+
+---
+
+## Библиографическая запись
+
+Von Hippel, M. (2025). *Verification and Attack Synthesis for Network Protocols*.
+arXiv preprint arXiv:2511.01124.
+DOI: [10.48550/arXiv.2511.01124](https://doi.org/10.48550/arXiv.2511.01124)
+
+---
+
+## 3.X.7. Конечная абстракция: граф K_GBN при N=2
+
+Поскольку полное пространство состояний K_GBN бесконечно (номера пакетов
+не ограничены), для иллюстрации и верификации строится **конечная абстракция**
+с фиксированными параметрами: N=2, hiAck ∈ {1,2,3}.
+
+### Кодирование состояний
+
+Каждое состояние отправителя кодируется парой (hiAck, curPkt):
+
+| Состояние | hiAck | curPkt | Условие         | Режим |
+|-----------|-------|--------|-----------------|-------|
+| s0        | 1     | 1      | 1 < 1+2=3       | OPEN  |
+| s1        | 1     | 2      | 2 < 1+2=3       | OPEN  |
+| s2        | 1     | 3      | 3 = 1+2=3       | FULL  |
+| s3        | 2     | 2      | 2 < 2+2=4       | OPEN  |
+| s4        | 2     | 3      | 3 < 2+2=4       | OPEN  |
+| s5        | 2     | 4      | 4 = 2+2=4       | FULL  |
+| s6        | 3     | 3      | 3 < 3+2=5       | OPEN  |
+| s7        | 3     | 4      | 4 < 3+2=5       | OPEN  |
+| s8        | 3     | 5      | 5 = 3+2=5       | FULL  |
+| s_t1      | —     | —      | timeout из s2   | —     |
+| s_t2      | —     | —      | timeout из s5   | —     |
+| s_t3      | —     | —      | timeout из s8   | —     |
+| s_done    | >3    | —      | за пределами абстракции | — |
+
+### Переходы (из формулы senderR)
+
+Каждый переход соответствует одной ветке формулы senderR:
+
+```
+advCur  (curPkt < hiAck+N):
+  s0 → s1    s1 → s2    s3 → s4    s4 → s5    s6 → s7    s7 → s8
+
+rcvAck  (a > hiAck, curPkt ← max(curPkt, a)):
+  s1 → s3    (rcvAck(2): hiAck 1→2, curPkt max(2,2)=2)
+  s2 → s4    (rcvAck(2): hiAck 1→2, curPkt max(3,2)=3)
+  s2 → s6    (rcvAck(3): hiAck 1→3, curPkt max(3,3)=3)
+  s4 → s6    (rcvAck(3): hiAck 2→3, curPkt max(3,3)=3)
+  s5 → s7    (rcvAck(3): hiAck 2→3, curPkt max(4,3)=4)
+  s5 → s_done, s7 → s_done, s8 → s_done  (hiAck > 3)
+
+timeout (curPkt = hiAck+N, curPkt ← hiAck):
+  s2  → s_t1 → s0    (curPkt ← hiAck=1)
+  s5  → s_t2 → s3    (curPkt ← hiAck=2)
+  s8  → s_t3 → s6    (curPkt ← hiAck=3)
+```
+
+### Функция разметки L(s) для конечной абстракции
+
+```
+L(s0) = {transmitting, Channel_open}
+L(s1) = {transmitting, Channel_open, Packet_in_channel}
+L(s2) = {window_full, Waiting_ACK}
+L(s3) = {transmitting, Channel_open, ACK_received}
+L(s4) = {transmitting, Channel_open, Packet_in_channel}
+L(s5) = {window_full, Waiting_ACK}
+L(s6) = {transmitting, Channel_open, ACK_received}
+L(s7) = {transmitting, Channel_open, Packet_in_channel}
+L(s8) = {window_full, Waiting_ACK}
+L(s_t1) = L(s_t2) = L(s_t3) = {timeout_fired, Retransmission_started}
+L(s_done) = {Connection_complete}
+```
+
+---
+
+## 3.X.8. Детализация компонента TBF
+
+Token Bucket Filter (TBF) — это компонент, который вносит в модель
+реалистичное поведение канала. Без TBF модель описывала бы идеальный канал,
+в котором каждый пакет мгновенно доставляется без потерь.
+
+### Состояние TBF
+
+```
+s_tbf = (bkt, dgs)
+
+  bkt ∈ ℕ, 0 ≤ bkt ≤ bcap    -- токены в корзине
+  dgs = [(t₁,d₁), (t₂,d₂), …]  -- очередь датаграмм
+          tᵢ ∈ Ord              -- оставшееся время жизни
+          dᵢ = (id, payload)    -- датаграмма
+```
+
+### Четыре типа переходов TBF
+
+| Функция       | Тип       | Предусловие             | Эффект                          |
+|---------------|-----------|-------------------------|---------------------------------|
+| `tick`        | internal  | всегда                  | bkt += rt (до bcap); age(dgs)  |
+| `process(d)`  | external  | sz(dgs)+sz(d) ≤ dcap    | dgs ← d :: dgs                 |
+| `forward(i)`  | internal  | sz(dgsᵢ) ≤ bkt          | bkt -= sz(dgsᵢ); rcvb(dgsᵢ)   |
+| `drop(i)`     | internal  | i < len(dgs)            | удалить dgsᵢ из dgs            |
+| `decay`       | internal  | bkt > 0                 | bkt -= 1                       |
+
+### Что TBF добавляет в глобальную L(s)
+
+Пропозиция `channel_loss` становится истинной только из TBF-состояний:
+
+```
+L(s_global) ∋ channel_loss  ⟺  sz(dgs) + sz(d) > dcap
+                                  (TBF не принял новую датаграмму)
+
+L(s_global) ∋ transmitting  ⟺  curPkt < hiAck+N       (Sender)
+                               ∨ len(dgs) > 0           (TBF: пакеты в пути)
+```
+
+### Ключевое свойство TBF — композиционность (Теорема 4)
+
+В диссертации доказано, что последовательная композиция двух TBF
+эквивалентна одному TBF с суммарными параметрами:
+
+```
+TBF_s ⊕ TBF_r ≅ TBF_single(bcap₂, dcap₁+dcap₂, rt₂, del₁+del₂)
+```
+
+Это означает: в рамках K_GBN достаточно рассматривать один TBF
+вместо двух, что упрощает верификацию без потери точности.
+
+---
+
+## 3.X.9. Формат JSON для верификации (nuXmv)
+
+Модель K_GBN представляется в формате JSON и передаётся генератору SMV-кода.
+Структура файла:
+
+```json
+{
+  "states": ["s0", "s1", "s2", ...],
+  "initial_states": ["s0"],
+  "transitions": [
+    ["s0", "s1"],
+    ["s1", "s2"],
+    ...
+  ],
+  "state_predicates": [
+    {"state": "s0", "predicates": ["transmitting", "Channel_open"]},
+    {"state": "s2", "predicates": ["window_full", "Waiting_ACK"]},
+    ...
+  ],
+  "specifications": [
+    "AG (EX TRUE)",
+    "AG (window_full -> AF transmitting)",
+    "AG !(window_full & transmitting)",
+    "AG (timeout_fired -> AF transmitting)",
+    "AG (transmitting -> AF (window_full | Connection_complete))",
+    "AG (ACK_received -> AF (window_full | Connection_complete))"
+  ]
+}
+```
+
+Поле `"specifications"` — новое по сравнению с бакалаврской работой:
+спецификации CTL читаются из JSON и выводятся в SMV-файл как блоки `SPEC`.
+В бакалаврской они были захардкожены в C++.
+
+### Соответствие LTL-свойств и CTL-спецификаций
+
+| LTL-свойство (теория)                        | CTL-спецификация (nuXmv)                                     |
+|----------------------------------------------|--------------------------------------------------------------|
+| G(window_full → F transmitting)              | AG (window_full -> AF transmitting)                          |
+| G ¬(window_full ∧ transmitting)              | AG !(window_full & transmitting)                             |
+| G(timeout_fired → F transmitting)            | AG (timeout_fired -> AF transmitting)                        |
+| G(transmitting → F window_full)              | AG (transmitting -> AF (window_full \| Connection_complete)) |
+
+---
+
+## Библиографическая запись
+
+Von Hippel, M. (2025). *Verification and Attack Synthesis for Network Protocols*.
+arXiv preprint arXiv:2511.01124.
+DOI: [10.48550/arXiv.2511.01124](https://doi.org/10.48550/arXiv.2511.01124)
