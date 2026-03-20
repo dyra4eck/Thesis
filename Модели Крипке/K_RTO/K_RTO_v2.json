@@ -260,5 +260,8 @@
       "Obs5": "s9→s10: srtt_converging → rto_adequate",
       "Obs6": "s9→s11: патологический случай rttvar < r"
     }
-  }
+  },
+  "fairness": [
+    "sampling_enabled | Transmission_complete | Connection_aborted"
+  ]
 }
